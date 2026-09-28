@@ -1,0 +1,21 @@
+# Python virtual environment
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Large dataset
+WELFake_Dataset.csv
+
+# Trained BERT model
+hybrid_bert_model/
+
+# Local databases
+*.db
+
+# Temporary/test files
+test_fake.txt
+
+# Environment/secrets
+.env
