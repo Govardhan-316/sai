@@ -1,0 +1,9 @@
+venv/
+__pycache__/
+*.pyc
+*.db
+*.sqlite3
+WELFake_Dataset*.csv
+hybrid_bert_model*/
+stage1/
+stage1_output/
