@@ -1,82 +1,105 @@
+
 import pandas as pd
-import torch
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from sklearn.model_selection import train_test_split
+from predict import predict_news
 
-MODEL_DIR = "./hybrid_bert_model"
+DATASET = "WELFake_Dataset.csv"
+MAX_ROWS_PER_CLASS = 10000
 
-print("Loading dataset...")
-df = pd.read_csv("WELFake_Dataset.csv")
+print("Loading and preparing dataset...")
 
-df = df[["title", "text", "label"]].dropna()
+df = pd.read_csv(DATASET)
 
-# Take 10 Fake + 10 Real examples
-fake = df[df["label"] == 0].sample(10, random_state=42)
-real = df[df["label"] == 1].sample(10, random_state=42)
+# Keep the required columns
+df = df[["title", "text", "label"]].copy()
 
-test_df = pd.concat([fake, real]).sample(frac=1, random_state=42)
+# Match the training label filtering
+df["label"] = df["label"].astype(str).str.strip()
+df = df[df["label"].isin(["0", "1"])].copy()
+df["label"] = df["label"].astype(int)
 
-print("Loading model...")
+# Match the training text cleaning
+for column in ["title", "text"]:
+    df[column] = df[column].fillna("").astype(str).str.strip()
 
-tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
-model = AutoModelForSequenceClassification.from_pretrained(MODEL_DIR)
+df = df[~((df["title"] == "") & (df["text"] == ""))]
+df = df.drop_duplicates(subset=["title", "text"])
 
-model.eval()
+# Match the balanced dataset preparation
+fake = df[df["label"] == 0]
+real = df[df["label"] == 1]
+
+fake = fake.sample(
+    n=min(MAX_ROWS_PER_CLASS, len(fake)),
+    random_state=42
+)
+real = real.sample(
+    n=min(MAX_ROWS_PER_CLASS, len(real)),
+    random_state=42
+)
+
+df = pd.concat([fake, real]).sample(
+    frac=1,
+    random_state=42
+).reset_index(drop=True)
+
+# Recreate the held-out test split
+_, test_df = train_test_split(
+    df,
+    test_size=0.20,
+    random_state=42,
+    stratify=df["label"]
+)
+
+# Test 10 Fake and 10 Real held-out articles
+fake_test = test_df[test_df["label"] == 0].sample(
+    n=min(10, len(test_df[test_df["label"] == 0])),
+    random_state=42
+)
+real_test = test_df[test_df["label"] == 1].sample(
+    n=min(10, len(test_df[test_df["label"] == 1])),
+    random_state=42
+)
+
+test_df = pd.concat([fake_test, real_test]).sample(
+    frac=1,
+    random_state=42
+)
 
 correct = 0
+total = len(test_df)
 
-print("\n==============================")
-print("MODEL TEST - 20 ARTICLES")
-print("==============================\n")
+print("\n========================================")
+print("SAVED MODEL TEST - HELD-OUT ARTICLES")
+print("========================================")
 
-for i, row in enumerate(test_df.itertuples(), 1):
+for i, (_, row) in enumerate(test_df.iterrows(), 1):
 
-    news = str(row.title) + " " + str(row.text)
+    # Match train.py: use article text; use title only if text is empty
+    news = row["text"] if row["text"] else row["title"]
 
-    prompt = (
-        "Classify the following news article as real or fake. "
-        "Use contextual language patterns and the knowledge-guided hints. "
-        "News: " + news
-    )
+    # Use the same prediction function as the application
+    prediction, confidence = predict_news(news)
 
-    inputs = tokenizer(
-        prompt,
-        return_tensors="pt",
-        truncation=True,
-        max_length=128
-    )
+    actual = "Fake" if row["label"] == 0 else "Real"
+    result = "CORRECT" if prediction == actual else "WRONG"
 
-    with torch.no_grad():
-        outputs = model(**inputs)
-
-    probabilities = torch.softmax(outputs.logits, dim=1)[0]
-
-    predicted_class = int(torch.argmax(probabilities))
-
-    # WELFake: 0 = Fake, 1 = Real
-    predicted_label = "Fake" if predicted_class == 0 else "Real"
-
-    actual_label = "Fake" if int(row.label) == 0 else "Real"
-
-    confidence = float(probabilities[predicted_class]) * 100
-
-    if predicted_label == actual_label:
+    if result == "CORRECT":
         correct += 1
-        result = "CORRECT"
-    else:
-        result = "WRONG"
 
     print(
-        f"{i:02d}. Actual={actual_label:<5} "
-        f"Predicted={predicted_label:<5} "
+        f"\n{i:02d}. Actual={actual:<5} "
+        f"Predicted={prediction:<5} "
         f"Confidence={confidence:6.2f}% "
         f"[{result}]"
     )
+    print("Article:", news[:180].replace("\n", " "))
 
-accuracy = (correct / len(test_df)) * 100
+accuracy = correct / total * 100 if total else 0
 
-print("\n==============================")
+print("\n========================================")
 print("FINAL RESULT")
-print("==============================")
-print(f"Correct predictions : {correct}/20")
-print(f"Test accuracy       : {accuracy:.2f}%")
-print("==============================")
+print("========================================")
+print(f"Correct predictions: {correct}/{total}")
+print(f"Accuracy on this sample: {accuracy:.2f}%")
+print("========================================")

@@ -1,7 +1,9 @@
-
+﻿
 from flask import Flask, request, jsonify, render_template_string
 import sqlite3
 from datetime import datetime
+import os
+import re
 
 from predict import predict_news, analyze_suspicious_language
 
@@ -13,6 +15,113 @@ from predict import predict_news, analyze_suspicious_language
 app = Flask(__name__)
 
 DATABASE = "prediction_history.db"
+
+# Trained model directory.
+# The accuracy is read automatically from training_info.txt.
+MODEL_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "hybrid_bert_model_v5"
+)
+
+TRAINING_INFO_FILE = os.path.join(
+    MODEL_DIR,
+    "training_info.txt"
+)
+
+
+def get_model_accuracy():
+    """Read the latest saved test accuracy from the trained model files."""
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # Try all normal locations so the app works whether it is
+    # started from C:\fake-news-detection or another working directory.
+    candidates = [
+        os.path.join(base_dir, "hybrid_bert_model_v5", "training_info.txt"),
+        os.path.join(os.getcwd(), "hybrid_bert_model_v5", "training_info.txt"),
+        os.path.join(base_dir, "hybrid_bert_model_v4", "training_info.txt"),
+        os.path.join(os.getcwd(), "hybrid_bert_model_v4", "training_info.txt"),
+        os.path.join(base_dir, "hybrid_bert_model", "training_info.txt"),
+        os.path.join(os.getcwd(), "hybrid_bert_model", "training_info.txt"),
+        os.path.join(base_dir, "training_info.txt"),
+        os.path.join(os.getcwd(), "training_info.txt"),
+    ]
+
+    for file_path in candidates:
+        if not os.path.isfile(file_path):
+            continue
+
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            # Supports the exact format written by your train.py:
+            # Accuracy      : 0.9899494004297498
+            patterns = [
+                r"(?im)^\s*Accuracy\s*:\s*([0-9]*\.?[0-9]+)",
+                r"(?im)^\s*eval_accuracy\s*:\s*([0-9]*\.?[0-9]+)",
+                r"(?im)^\s*accuracy\s*[:=]\s*([0-9]*\.?[0-9]+)",
+            ]
+
+            for pattern in patterns:
+                match = re.search(pattern, content)
+                if match:
+                    accuracy = float(match.group(1))
+
+                    if 0 <= accuracy <= 1:
+                        accuracy *= 100
+
+                    accuracy = round(accuracy, 2)
+
+                    print(
+                        f"MODEL ACCURACY LOADED: {accuracy:.2f}%"
+                    )
+                    print(f"Accuracy source: {file_path}")
+                    return accuracy
+
+        except Exception as e:
+            print(f"Could not read {file_path}: {e}")
+
+    # Final fallback: read Hugging Face trainer_state.json if present.
+    import json
+
+    trainer_files = [
+        os.path.join(base_dir, "hybrid_bert_model_v5", "trainer_state.json"),
+        os.path.join(base_dir, "hybrid_bert_model_v5", "checkpoint-525", "trainer_state.json"),
+        os.path.join(os.getcwd(), "hybrid_bert_model_v5", "trainer_state.json"),
+        os.path.join(os.getcwd(), "hybrid_bert_model_v5", "checkpoint-525", "trainer_state.json"),
+        os.path.join(base_dir, "hybrid_bert_model_v4", "trainer_state.json"),
+        os.path.join(base_dir, "hybrid_bert_model", "trainer_state.json"),
+    ]
+
+    for file_path in trainer_files:
+        if not os.path.isfile(file_path):
+            continue
+
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                state = json.load(f)
+
+            history = state.get("log_history", [])
+
+            for entry in reversed(history):
+                value = entry.get("eval_accuracy")
+                if value is not None:
+                    accuracy = float(value)
+                    if 0 <= accuracy <= 1:
+                        accuracy *= 100
+                    accuracy = round(accuracy, 2)
+                    print(
+                        f"MODEL ACCURACY LOADED: {accuracy:.2f}%"
+                    )
+                    print(f"Accuracy source: {file_path}")
+                    return accuracy
+
+        except Exception as e:
+            print(f"Could not read {file_path}: {e}")
+
+    print("WARNING: Model accuracy file was not found.")
+    print("Expected: hybrid_bert_model\\training_info.txt")
+    return None
 
 
 # ============================================================
@@ -64,7 +173,9 @@ def save_prediction(
         prediction,
         confidence,
         explanation,
-        datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        datetime.now().strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
     ))
 
     conn.commit()
@@ -109,6 +220,56 @@ def get_history():
     return history
 
 
+def get_statistics():
+
+    conn = sqlite3.connect(DATABASE)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        "SELECT COUNT(*) FROM predictions"
+    )
+
+    total = cursor.fetchone()[0]
+
+    cursor.execute("""
+        SELECT COUNT(*)
+        FROM predictions
+        WHERE LOWER(prediction) = 'real'
+    """)
+
+    real_count = cursor.fetchone()[0]
+
+    cursor.execute("""
+        SELECT COUNT(*)
+        FROM predictions
+        WHERE LOWER(prediction) = 'fake'
+    """)
+
+    fake_count = cursor.fetchone()[0]
+
+    cursor.execute("""
+        SELECT AVG(confidence)
+        FROM predictions
+    """)
+
+    avg_confidence = cursor.fetchone()[0]
+
+    conn.close()
+
+    if avg_confidence is None:
+        avg_confidence = 0
+
+    return {
+        "total": total,
+        "real": real_count,
+        "fake": fake_count,
+        "average_confidence": round(
+            avg_confidence,
+            1
+        )
+    }
+
+
 def clear_history():
 
     conn = sqlite3.connect(DATABASE)
@@ -123,88 +284,69 @@ def clear_history():
 
 
 # ============================================================
-# SUSPICIOUS LANGUAGE ANALYSIS
+# SEPARATE WARNING LAYER
 # ============================================================
 
-def get_explanation(text):
+def get_warning_layer(text):
+    """Return linguistic warning signals separately from BERT's label.
 
+    This layer does not change the BERT prediction and does not verify truth.
+    """
     try:
-
         suspicious = analyze_suspicious_language(text)
-
-    except Exception as e:
-
-        print(
-            "Suspicious language error:",
-            e
-        )
-
+    except Exception as error:
+        print("Warning-layer analysis error:", error)
         suspicious = []
 
-
-    if not suspicious:
-
-        return {
-            "count": 0,
-            "items": [],
-            "message":
-                "No strong suspicious linguistic patterns were detected."
-        }
-
-
     items = []
-
+    categories = set()
 
     for item in suspicious:
-
         if isinstance(item, dict):
-
-            category = item.get(
-                "category",
-                "Suspicious Language"
-            )
-
-            phrases = item.get(
-                "phrases",
-                []
-            )
-
-
+            category = str(item.get("category", "Suspicious Language"))
+            phrases = item.get("phrases", [])
             if isinstance(phrases, list):
-
                 for phrase in phrases:
-
-                    items.append({
-                        "category": category,
-                        "phrase": str(phrase)
-                    })
-
-
+                    phrase = str(phrase)
+                    items.append({"category": category, "phrase": phrase})
+                    categories.add(category)
         else:
+            phrase = str(item)
+            items.append({"category": "Suspicious Language", "phrase": phrase})
+            categories.add("Suspicious Language")
 
-            items.append({
-                "category":
-                    "Suspicious Language",
-
-                "phrase":
-                    str(item)
-            })
-
+    category_count = len(categories)
+    if category_count >= 3:
+        level = "review"
+        status = "Several warning patterns found"
+    elif category_count >= 1:
+        level = "review"
+        status = "Some warning patterns found"
+    else:
+        level = "none"
+        status = "No listed warning patterns found"
 
     return {
         "count": len(items),
-
+        "category_count": category_count,
+        "level": level,
+        "status": status,
         "items": items,
-
-        "message":
-            "Suspicious linguistic patterns were detected. "
-            "These are supporting linguistic signals and do not "
-            "independently verify the factual truth of the article."
+        "message": (
+            "These are language-based warning signals only. They do not prove "
+            "that an article is fake, and they do not change the BERT prediction. "
+            "Verify important claims with reliable, independent sources."
+        ),
     }
 
 
+def get_explanation(text):
+    """Backward-compatible alias used by existing app code and UI."""
+    return get_warning_layer(text)
+
+
 # ============================================================
-# HTML DASHBOARD
+# HTML
 # ============================================================
 
 HTML = r"""
@@ -214,1314 +356,1047 @@ HTML = r"""
 
 <head>
 
-<meta charset="UTF-8">
+    <meta charset="UTF-8">
 
-<meta
-    name="viewport"
-    content="width=device-width, initial-scale=1.0"
->
+    <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1.0"
+    >
 
-<title>
-    Fake News Detection Using NLP
-</title>
+    <title>
+        NewsGuard AI | Fake News Detection
+    </title>
 
 
-<style>
+    <!-- Bootstrap 5 -->
 
-/* ============================================================
-   GENERAL
-   ============================================================ */
+    <link
+        href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css"
+        rel="stylesheet"
+    >
 
-* {
-    box-sizing: border-box;
-    margin: 0;
-    padding: 0;
-}
 
-body {
+    <!-- Bootstrap Icons -->
 
-    font-family:
-        Arial,
-        Helvetica,
-        sans-serif;
+    <link
+        href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.css"
+        rel="stylesheet"
+    >
 
-    background: #f4f7fb;
 
-    color: #172033;
+    <style>
 
-    min-height: 100vh;
-}
+        /* ==================================================
+           GLOBAL
+        ================================================== */
 
+        :root {
 
-/* ============================================================
-   SIDEBAR
-   ============================================================ */
+            --primary: #4f46e5;
+            --primary-dark: #3730a3;
 
-.sidebar {
+            --dark: #111827;
+            --muted: #6b7280;
 
-    position: fixed;
+            --bg: #f5f7fb;
 
-    left: 0;
-    top: 0;
-    bottom: 0;
+            --card: #ffffff;
 
-    width: 240px;
+            --border: #e5e7eb;
 
-    background: #101828;
+            --success: #16a34a;
 
-    color: white;
+            --danger: #dc2626;
 
-    padding: 25px 18px;
+            --warning: #d97706;
+        }
 
-    z-index: 10;
-}
 
+        * {
+            box-sizing: border-box;
+        }
 
-.logo {
 
-    display: flex;
+        body {
 
-    align-items: center;
+            margin: 0;
 
-    gap: 12px;
+            background:
+                linear-gradient(
+                    135deg,
+                    #f8fafc,
+                    #eef2ff
+                );
 
-    padding: 0 10px 25px;
+            color: var(--dark);
 
-    border-bottom:
-        1px solid
-        rgba(255,255,255,0.08);
+            font-family:
+                Inter,
+                -apple-system,
+                BlinkMacSystemFont,
+                "Segoe UI",
+                sans-serif;
+        }
 
-    margin-bottom: 25px;
-}
 
+        /* ==================================================
+           NAVBAR
+        ================================================== */
 
-.logo-icon {
+        .navbar-custom {
 
-    width: 42px;
-    height: 42px;
+            background: rgba(
+                255,
+                255,
+                255,
+                0.94
+            );
 
-    border-radius: 10px;
+            backdrop-filter: blur(12px);
 
-    background: #2563eb;
+            border-bottom:
+                1px solid var(--border);
 
-    display: flex;
+            position: sticky;
 
-    align-items: center;
+            top: 0;
 
-    justify-content: center;
+            z-index: 1000;
+        }
 
-    font-weight: bold;
-}
 
+        .brand-icon {
 
-.logo-text {
+            width: 42px;
 
-    font-size: 16px;
+            height: 42px;
 
-    font-weight: bold;
-}
+            border-radius: 12px;
 
+            background:
+                linear-gradient(
+                    135deg,
+                    #4f46e5,
+                    #7c3aed
+                );
 
-.logo-subtitle {
+            color: white;
 
-    color: #98a2b3;
+            display: flex;
 
-    font-size: 11px;
+            align-items: center;
 
-    margin-top: 3px;
-}
+            justify-content: center;
 
+            font-size: 21px;
 
-.nav-title {
+            box-shadow:
+                0 8px 20px
+                rgba(79,70,229,.25);
+        }
 
-    color: #667085;
 
-    font-size: 10px;
+        .brand-title {
 
-    font-weight: bold;
+            font-weight: 800;
 
-    text-transform: uppercase;
+            font-size: 19px;
 
-    padding: 0 12px;
+            letter-spacing: -.4px;
+        }
 
-    margin-bottom: 10px;
-}
 
+        .brand-subtitle {
 
-.nav-item {
+            color: var(--muted);
 
-    display: flex;
+            font-size: 11px;
 
-    align-items: center;
+            margin-top: -3px;
+        }
 
-    gap: 12px;
 
-    padding: 12px;
+        .nav-link {
 
-    border-radius: 8px;
+            color: #4b5563 !important;
 
-    margin-bottom: 5px;
+            font-weight: 600;
 
-    color: #c9d1dc;
+            margin-left: 10px;
 
-    font-size: 14px;
+            cursor: pointer;
+        }
 
-    cursor: pointer;
-}
 
+        .nav-link:hover {
 
-.nav-item:hover {
+            color:
+                var(--primary) !important;
+        }
 
-    background: #1d2939;
 
-    color: white;
-}
+        .online-dot {
 
+            width: 9px;
 
-.nav-item.active {
+            height: 9px;
 
-    background: #1d4ed8;
+            background:
+                #22c55e;
 
-    color: white;
-}
+            border-radius: 50%;
 
+            display: inline-block;
 
-.nav-icon {
+            box-shadow:
+                0 0 0 4px
+                rgba(34,197,94,.12);
+        }
 
-    width: 25px;
 
-    text-align: center;
+        /* ==================================================
+           MAIN
+        ================================================== */
 
-    font-weight: bold;
-}
+        .main-container {
 
+            max-width: 1250px;
 
-.sidebar-bottom {
+            margin: auto;
 
-    position: absolute;
+            padding:
+                45px 20px 70px;
+        }
 
-    bottom: 25px;
 
-    left: 18px;
+        .hero-title {
 
-    right: 18px;
+            font-size:
+                clamp(
+                    30px,
+                    4vw,
+                    46px
+                );
 
-    background: #172033;
+            font-weight: 800;
 
-    padding: 14px;
+            letter-spacing: -1.5px;
 
-    border-radius: 10px;
-}
+            margin-bottom: 10px;
+        }
 
 
-.status-row {
+        .hero-description {
 
-    display: flex;
+            color: var(--muted);
 
-    align-items: center;
+            font-size: 16px;
 
-    gap: 8px;
+            max-width: 720px;
+        }
 
-    font-size: 12px;
-}
 
+        .model-pill {
 
-.status-dot {
+            background:
+                #eef2ff;
 
-    width: 8px;
-    height: 8px;
+            color:
+                #4338ca;
 
-    background: #12b76a;
+            border:
+                1px solid #c7d2fe;
 
-    border-radius: 50%;
-}
+            padding:
+                10px 16px;
 
+            border-radius: 30px;
 
-.status-text {
+            font-size: 13px;
 
-    color: #98a2b3;
+            font-weight: 700;
 
-    font-size: 11px;
+            display: inline-flex;
 
-    margin-top: 5px;
+            align-items: center;
 
-    padding-left: 16px;
-}
+            gap: 7px;
+        }
 
 
-/* ============================================================
-   MAIN
-   ============================================================ */
+        /* ==================================================
+           STAT CARDS
+        ================================================== */
 
-.main {
+        .stat-card {
 
-    margin-left: 240px;
+            background: var(--card);
 
-    min-height: 100vh;
-}
+            border:
+                1px solid var(--border);
 
+            border-radius: 18px;
 
-.topbar {
+            padding: 22px;
 
-    height: 70px;
+            height: 100%;
 
-    background: white;
+            box-shadow:
+                0 8px 25px
+                rgba(15,23,42,.05);
 
-    border-bottom:
-        1px solid #eaecf0;
+            transition:
+                transform .2s,
+                box-shadow .2s;
+        }
 
-    display: flex;
 
-    align-items: center;
+        .stat-card:hover {
 
-    justify-content: space-between;
+            transform:
+                translateY(-3px);
 
-    padding: 0 30px;
-}
+            box-shadow:
+                0 15px 35px
+                rgba(15,23,42,.09);
+        }
 
 
-.breadcrumb {
+        .stat-icon {
 
-    color: #667085;
+            width: 43px;
 
-    font-size: 13px;
-}
+            height: 43px;
 
+            border-radius: 12px;
 
-.breadcrumb strong {
+            display: flex;
 
-    color: #172033;
-}
+            align-items: center;
 
+            justify-content: center;
 
-.top-status {
+            font-size: 19px;
 
-    display: flex;
+            margin-bottom: 15px;
+        }
 
-    align-items: center;
 
-    gap: 8px;
+        .icon-blue {
 
-    color: #475467;
+            background: #eef2ff;
 
-    font-size: 13px;
-}
+            color: #4f46e5;
+        }
 
 
-.green-dot {
+        .icon-green {
 
-    width: 8px;
-    height: 8px;
+            background: #ecfdf5;
 
-    background: #12b76a;
+            color: #16a34a;
+        }
 
-    border-radius: 50%;
-}
 
+        .icon-red {
 
-/* ============================================================
-   CONTENT
-   ============================================================ */
+            background: #fef2f2;
 
-.content {
+            color: #dc2626;
+        }
 
-    padding: 30px;
 
-    max-width: 1500px;
+        .icon-orange {
 
-    margin: auto;
-}
+            background: #fff7ed;
 
+            color: #ea580c;
+        }
 
-.page-header {
 
-    display: flex;
+        .stat-label {
 
-    justify-content: space-between;
+            color: var(--muted);
 
-    align-items: flex-end;
+            font-size: 12px;
 
-    margin-bottom: 25px;
+            font-weight: 700;
 
-    gap: 20px;
-}
+            text-transform:
+                uppercase;
 
+            letter-spacing: .6px;
+        }
 
-.page-title {
 
-    font-size: 28px;
+        .stat-value {
 
-    margin-bottom: 7px;
+            font-size: 30px;
 
-    color: #101828;
-}
+            font-weight: 800;
 
+            margin-top: 4px;
+        }
 
-.page-description {
 
-    color: #667085;
+        /* ==================================================
+           CARDS
+        ================================================== */
 
-    font-size: 14px;
+        .dashboard-card {
 
-    max-width: 750px;
+            background: white;
 
-    line-height: 1.5;
-}
+            border:
+                1px solid var(--border);
 
+            border-radius: 20px;
 
-.model-badge {
+            box-shadow:
+                0 8px 30px
+                rgba(15,23,42,.055);
 
-    padding: 8px 13px;
+            overflow: hidden;
 
-    background: #eff6ff;
+            height: 100%;
+        }
 
-    color: #1d4ed8;
 
-    border:
-        1px solid #bfdbfe;
+        .card-header-custom {
 
-    border-radius: 20px;
+            padding:
+                22px 25px;
 
-    font-size: 12px;
+            border-bottom:
+                1px solid var(--border);
 
-    font-weight: bold;
+            background:
+                rgba(249,250,251,.75);
+        }
 
-    white-space: nowrap;
-}
 
+        .card-title-custom {
 
-/* ============================================================
-   GRID
-   ============================================================ */
+            font-size: 16px;
 
-.dashboard-grid {
+            font-weight: 800;
+        }
 
-    display: grid;
 
-    grid-template-columns:
-        minmax(0, 1.55fr)
-        minmax(300px, 0.85fr);
+        .card-subtitle-custom {
 
-    gap: 22px;
+            font-size: 12px;
 
-    align-items: start;
-}
+            color: var(--muted);
 
+            margin-top: 3px;
+        }
 
-/* ============================================================
-   CARDS
-   ============================================================ */
 
-.card {
+        .card-body-custom {
 
-    background: white;
+            padding: 25px;
+        }
 
-    border:
-        1px solid #eaecf0;
 
-    border-radius: 12px;
+        /* ==================================================
+           NEWS TEXTAREA
+        ================================================== */
 
-    box-shadow:
-        0 2px 5px
-        rgba(16,24,40,0.03);
+        .news-textarea {
 
-    overflow: hidden;
-}
+            width: 100%;
 
+            min-height: 260px;
 
-.card-header {
+            border:
+                1px solid #dbe1ea;
 
-    padding: 20px 22px;
+            border-radius: 15px;
 
-    border-bottom:
-        1px solid #eaecf0;
+            padding: 18px;
 
-    display: flex;
+            resize: vertical;
 
-    align-items: center;
+            outline: none;
 
-    justify-content: space-between;
-}
+            font-size: 14px;
 
+            line-height: 1.7;
 
-.card-title {
+            transition:
+                border .2s,
+                box-shadow .2s;
+        }
 
-    font-size: 15px;
 
-    font-weight: bold;
+        .news-textarea:focus {
 
-    color: #101828;
-}
+            border-color:
+                var(--primary);
 
+            box-shadow:
+                0 0 0 4px
+                rgba(79,70,229,.10);
+        }
 
-.card-subtitle {
 
-    font-size: 12px;
+        .btn-primary-custom {
 
-    color: #667085;
+            background:
+                linear-gradient(
+                    135deg,
+                    #4f46e5,
+                    #6366f1
+                );
 
-    margin-top: 4px;
-}
+            border: none;
 
+            color: white;
 
-.card-body {
+            font-weight: 700;
 
-    padding: 22px;
-}
+            padding:
+                11px 21px;
 
+            border-radius: 11px;
 
-/* ============================================================
-   TEXTAREA
-   ============================================================ */
+            transition:
+                transform .2s,
+                box-shadow .2s;
+        }
 
-textarea {
 
-    width: 100%;
+        .btn-primary-custom:hover {
 
-    min-height: 250px;
+            color: white;
 
-    resize: vertical;
+            transform:
+                translateY(-1px);
 
-    border:
-        1px solid #d0d5dd;
+            box-shadow:
+                0 8px 20px
+                rgba(79,70,229,.25);
+        }
 
-    border-radius: 9px;
 
-    padding: 16px;
+        .btn-secondary-custom {
 
-    font-family: Arial, sans-serif;
+            background: white;
 
-    font-size: 14px;
+            border:
+                1px solid var(--border);
 
-    line-height: 1.6;
+            color: #374151;
 
-    color: #344054;
+            font-weight: 600;
 
-    outline: none;
-}
+            padding:
+                10px 17px;
 
+            border-radius: 11px;
+        }
 
-textarea:focus {
 
-    border-color: #2563eb;
+        .btn-secondary-custom:hover {
 
-    box-shadow:
-        0 0 0 3px
-        rgba(37,99,235,0.10);
-}
+            background:
+                #f9fafb;
+        }
 
 
-/* ============================================================
-   BUTTONS
-   ============================================================ */
+        /* ==================================================
+           MODEL STATUS
+        ================================================== */
 
-.input-footer {
+        .status-box {
 
-    margin-top: 13px;
+            display: flex;
 
-    display: flex;
+            align-items: center;
 
-    justify-content: space-between;
+            gap: 12px;
 
-    align-items: center;
+            padding: 15px;
 
-    gap: 15px;
-}
+            background:
+                #f0fdf4;
 
+            border:
+                1px solid #bbf7d0;
 
-.action-buttons {
+            border-radius: 13px;
 
-    display: flex;
+            margin-bottom: 22px;
+        }
 
-    gap: 9px;
-}
 
+        .status-indicator {
 
-.primary-btn,
-.secondary-btn {
+            width: 11px;
 
-    padding: 11px 18px;
+            height: 11px;
 
-    border-radius: 7px;
+            background:
+                #22c55e;
 
-    font-size: 13px;
+            border-radius: 50%;
 
-    font-weight: bold;
+            box-shadow:
+                0 0 0 5px
+                rgba(34,197,94,.12);
+        }
 
-    cursor: pointer;
-}
 
+        .status-title {
 
-.primary-btn {
+            font-size: 13px;
 
-    border: none;
+            font-weight: 800;
 
-    background: #2563eb;
+            color: #166534;
+        }
 
-    color: white;
-}
 
+        .status-description {
 
-.primary-btn:hover {
+            font-size: 11px;
 
-    background: #1d4ed8;
-}
+            color: #4b7c5b;
+        }
 
 
-.primary-btn:disabled {
+        .info-row {
 
-    background: #98a2b3;
+            display: flex;
 
-    cursor: not-allowed;
-}
+            justify-content: space-between;
 
+            padding:
+                12px 0;
 
-.secondary-btn {
+            border-bottom:
+                1px solid #f0f1f3;
 
-    background: #f8fafc;
+            font-size: 13px;
+        }
 
-    border:
-        1px solid #d0d5dd;
 
-    color: #344054;
-}
+        .info-row:last-child {
 
+            border-bottom: none;
+        }
 
-.secondary-btn:hover {
 
-    background: #f2f4f7;
-}
+        .info-label {
 
+            color: var(--muted);
+        }
 
-.file-upload {
 
-    position: relative;
+        .info-value {
 
-    display: inline-flex;
-}
+            font-weight: 700;
+        }
 
 
-.file-upload input {
+        /* ==================================================
+           RESULT
+        ================================================== */
 
-    position: absolute;
+        .result-placeholder {
 
-    opacity: 0;
+            min-height: 300px;
 
-    width: 100%;
+            display: flex;
 
-    height: 100%;
+            flex-direction: column;
 
-    cursor: pointer;
-}
+            align-items: center;
 
+            justify-content: center;
 
-/* ============================================================
-   LOADING
-   ============================================================ */
+            text-align: center;
 
-.loading {
+            color: var(--muted);
+        }
 
-    display: none;
 
-    align-items: center;
+        .result-icon {
 
-    justify-content: center;
+            width: 65px;
 
-    gap: 8px;
+            height: 65px;
 
-    color: #667085;
+            border-radius: 20px;
 
-    font-size: 12px;
+            background:
+                #eef2ff;
 
-    margin-top: 14px;
-}
+            color:
+                #4f46e5;
 
+            display: flex;
 
-.spinner {
+            align-items: center;
 
-    width: 15px;
+            justify-content: center;
 
-    height: 15px;
+            font-size: 28px;
 
-    border:
-        2px solid #d0d5dd;
+            margin-bottom: 15px;
+        }
 
-    border-top-color: #2563eb;
 
-    border-radius: 50%;
+        .prediction-badge {
 
-    animation:
-        spin 0.7s linear infinite;
-}
+            display: inline-flex;
 
+            align-items: center;
 
-@keyframes spin {
+            gap: 8px;
 
-    to {
-        transform: rotate(360deg);
-    }
-}
+            padding:
+                9px 15px;
 
+            border-radius: 30px;
 
-/* ============================================================
-   RESULT
-   ============================================================ */
+            font-size: 13px;
 
-.result-area {
+            font-weight: 800;
+        }
 
-    min-height: 310px;
 
-    display: flex;
+        .prediction-fake {
 
-    align-items: center;
+            background:
+                #fef2f2;
 
-    justify-content: center;
+            color:
+                #b91c1c;
 
-    text-align: center;
+            border:
+                1px solid #fecaca;
+        }
 
-    padding: 25px;
-}
 
+        .prediction-real {
 
-.empty-result {
+            background:
+                #ecfdf5;
 
-    color: #98a2b3;
+            color:
+                #15803d;
 
-    font-size: 13px;
-}
+            border:
+                1px solid #bbf7d0;
+        }
 
 
-.result-content {
+        .confidence-number {
 
-    width: 100%;
-}
+            font-size: 43px;
 
+            font-weight: 900;
 
-.result-label {
+            letter-spacing: -1px;
+        }
 
-    font-size: 12px;
 
-    text-transform: uppercase;
+        .confidence-label {
 
-    letter-spacing: 1px;
+            color: var(--muted);
 
-    color: #667085;
+            font-size: 12px;
 
-    font-weight: bold;
+            font-weight: 600;
+        }
 
-    margin-bottom: 10px;
-}
 
+        .progress {
 
-.prediction {
+            height: 10px;
 
-    font-size: 36px;
+            border-radius: 20px;
 
-    font-weight: 800;
+            background:
+                #eef0f4;
+        }
 
-    margin-bottom: 18px;
-}
 
+        .progress-bar {
 
-.prediction.real {
+            border-radius: 20px;
+        }
 
-    color: #039855;
-}
 
+        .signal-badge {
 
-.prediction.fake {
+            display: inline-block;
 
-    color: #d92d20;
-}
+            padding:
+                7px 11px;
 
+            border-radius: 8px;
 
-.confidence-wrapper {
+            background:
+                #fff7ed;
 
-    max-width: 440px;
+            color:
+                #c2410c;
 
-    margin: auto;
-}
+            border:
+                1px solid #fed7aa;
 
+            font-size: 11px;
 
-.confidence-top {
+            font-weight: 700;
 
-    display: flex;
+            margin:
+                4px 4px 4px 0;
+        }
 
-    justify-content: space-between;
 
-    margin-bottom: 8px;
+        /* ==================================================
+           PIPELINE
+        ================================================== */
 
-    font-size: 12px;
+        .pipeline {
 
-    color: #667085;
-}
+            display: flex;
 
+            align-items: center;
 
-.confidence-value {
+            justify-content: space-between;
 
-    color: #101828;
+            gap: 8px;
 
-    font-weight: bold;
-}
+            overflow-x: auto;
 
+            padding:
+                10px 0;
+        }
 
-.progress {
 
-    width: 100%;
+        .pipeline-step {
 
-    height: 10px;
+            min-width: 120px;
 
-    background: #eaecf0;
+            text-align: center;
+        }
 
-    border-radius: 20px;
 
-    overflow: hidden;
-}
+        .pipeline-number {
 
+            width: 40px;
 
-.progress-bar {
+            height: 40px;
 
-    height: 100%;
+            border-radius: 50%;
 
-    background: #2563eb;
+            background:
+                #eef2ff;
 
-    border-radius: 20px;
+            color:
+                #4f46e5;
 
-    transition:
-        width 0.6s ease;
-}
+            margin:
+                0 auto 9px;
 
+            display: flex;
 
-/* ============================================================
-   EXPLANATION
-   ============================================================ */
+            align-items: center;
 
-.explanation {
+            justify-content: center;
 
-    margin-top: 25px;
+            font-weight: 800;
 
-    border-top:
-        1px solid #eaecf0;
+            font-size: 13px;
+        }
 
-    padding-top: 20px;
 
-    text-align: left;
-}
+        .pipeline-title {
 
+            font-size: 12px;
 
-.explanation-title {
+            font-weight: 800;
+        }
 
-    font-size: 13px;
 
-    font-weight: bold;
+        .pipeline-arrow {
 
-    margin-bottom: 10px;
+            color:
+                #9ca3af;
 
-    color: #344054;
-}
+            font-size: 20px;
+        }
 
 
-.explanation-message {
+        /* ==================================================
+           HISTORY TABLE
+        ================================================== */
 
-    font-size: 12px;
+        .table-wrapper {
 
-    color: #667085;
+            overflow-x: auto;
+        }
 
-    line-height: 1.5;
 
-    margin-bottom: 12px;
-}
+        .history-table {
 
+            margin: 0;
 
-.keyword-list {
+            min-width: 700px;
+        }
 
-    display: flex;
 
-    flex-wrap: wrap;
+        .history-table th {
 
-    gap: 7px;
-}
+            font-size: 11px;
 
+            text-transform:
+                uppercase;
 
-.keyword {
+            letter-spacing: .5px;
 
-    display: inline-flex;
+            color: var(--muted);
 
-    flex-direction: column;
+            background:
+                #f9fafb;
 
-    gap: 2px;
+            padding:
+                14px 18px;
+        }
 
-    padding: 7px 10px;
 
-    background: #fff7ed;
+        .history-table td {
 
-    border:
-        1px solid #fed7aa;
+            padding:
+                15px 18px;
 
-    border-radius: 7px;
-}
+            font-size: 13px;
 
+            vertical-align: middle;
+        }
 
-.keyword-category {
 
-    font-size: 9px;
+        .article-preview {
 
-    color: #9a3412;
+            max-width: 350px;
 
-    font-weight: bold;
+            white-space: nowrap;
 
-    text-transform: uppercase;
-}
+            overflow: hidden;
 
+            text-overflow: ellipsis;
+        }
 
-.keyword-word {
 
-    font-size: 11px;
+        .table-result {
 
-    color: #7c2d12;
-}
+            font-size: 11px;
 
+            font-weight: 800;
 
-/* ============================================================
-   COMPONENTS
-   ============================================================ */
+            padding:
+                6px 9px;
 
-.components-card {
+            border-radius: 7px;
+        }
 
-    margin-top: 22px;
-}
 
+        .table-fake {
 
-.component-grid {
+            background:
+                #fef2f2;
 
-    display: grid;
+            color:
+                #b91c1c;
+        }
 
-    grid-template-columns:
-        repeat(4, minmax(0, 1fr));
 
-    gap: 12px;
-}
+        .table-real {
 
+            background:
+                #ecfdf5;
 
-.component-btn {
+            color:
+                #15803d;
+        }
 
-    border:
-        1px solid #eaecf0;
 
-    background: #f8fafc;
+        /* ==================================================
+           LOADING
+        ================================================== */
 
-    border-radius: 9px;
+        .loading-container {
 
-    padding: 15px;
+            display: none;
 
-    text-align: left;
+            align-items: center;
 
-    cursor: pointer;
+            gap: 10px;
 
-    min-height: 112px;
-}
+            color:
+                #4f46e5;
 
+            font-weight: 700;
 
-.component-btn:hover {
+            font-size: 13px;
 
-    border-color: #93c5fd;
+            margin-top: 15px;
+        }
 
-    background: #eff6ff;
-}
 
+        /* ==================================================
+           FOOTER
+        ================================================== */
 
-.component-btn.active {
+        footer {
 
-    border-color: #2563eb;
+            border-top:
+                1px solid var(--border);
 
-    background: #eff6ff;
-}
+            padding:
+                25px 0;
 
+            color:
+                var(--muted);
 
-.component-number {
+            font-size: 12px;
+        }
 
-    color: #2563eb;
 
-    font-size: 11px;
+        /* ==================================================
+           RESPONSIVE
+        ================================================== */
 
-    font-weight: bold;
+        @media(max-width: 768px) {
 
-    margin-bottom: 9px;
-}
+            .main-container {
 
+                padding-top: 30px;
+            }
 
-.component-name {
+            .pipeline {
 
-    color: #101828;
+                justify-content:
+                    flex-start;
+            }
 
-    font-size: 13px;
+            .pipeline-arrow {
 
-    font-weight: bold;
+                display: none;
+            }
 
-    margin-bottom: 5px;
-}
+            .hero-title {
 
+                font-size: 31px;
+            }
 
-.component-short {
+        }
 
-    color: #667085;
-
-    font-size: 11px;
-
-    line-height: 1.35;
-}
-
-
-.component-details {
-
-    margin-top: 15px;
-
-    padding: 17px;
-
-    background: #f8fafc;
-
-    border:
-        1px solid #eaecf0;
-
-    border-radius: 9px;
-
-    display: none;
-}
-
-
-.component-details.show {
-
-    display: block;
-}
-
-
-.details-title {
-
-    color: #101828;
-
-    font-size: 14px;
-
-    font-weight: bold;
-
-    margin-bottom: 7px;
-}
-
-
-.details-text {
-
-    color: #667085;
-
-    font-size: 12px;
-
-    line-height: 1.6;
-}
-
-
-/* ============================================================
-   RIGHT SIDE
-   ============================================================ */
-
-.right-stack {
-
-    display: flex;
-
-    flex-direction: column;
-
-    gap: 22px;
-}
-
-
-.info-list {
-
-    display: flex;
-
-    flex-direction: column;
-
-    gap: 13px;
-}
-
-
-.info-row {
-
-    display: flex;
-
-    align-items: flex-start;
-
-    justify-content: space-between;
-
-    gap: 15px;
-
-    padding-bottom: 12px;
-
-    border-bottom:
-        1px solid #f2f4f7;
-}
-
-
-.info-row:last-child {
-
-    border-bottom: none;
-
-    padding-bottom: 0;
-}
-
-
-.info-label {
-
-    color: #667085;
-
-    font-size: 12px;
-}
-
-
-.info-value {
-
-    color: #344054;
-
-    font-size: 12px;
-
-    font-weight: bold;
-
-    text-align: right;
-}
-
-
-.stat-card {
-
-    padding: 20px;
-}
-
-
-.stat-label {
-
-    color: #667085;
-
-    font-size: 12px;
-
-    margin-bottom: 7px;
-}
-
-
-.stat-value {
-
-    font-size: 26px;
-
-    font-weight: 800;
-
-    color: #101828;
-}
-
-
-.stat-description {
-
-    color: #98a2b3;
-
-    font-size: 11px;
-
-    margin-top: 5px;
-}
-
-
-/* ============================================================
-   HISTORY
-   ============================================================ */
-
-.history-card {
-
-    margin-top: 22px;
-}
-
-
-.history-table-wrapper {
-
-    overflow-x: auto;
-}
-
-
-table {
-
-    width: 100%;
-
-    border-collapse: collapse;
-}
-
-
-th {
-
-    background: #f8fafc;
-
-    color: #667085;
-
-    font-size: 10px;
-
-    text-transform: uppercase;
-
-    padding: 12px;
-
-    text-align: left;
-
-    white-space: nowrap;
-}
-
-
-td {
-
-    border-top:
-        1px solid #eaecf0;
-
-    padding: 13px 12px;
-
-    color: #475467;
-
-    font-size: 12px;
-
-    vertical-align: top;
-}
-
-
-.news-preview {
-
-    max-width: 400px;
-
-    white-space: nowrap;
-
-    overflow: hidden;
-
-    text-overflow: ellipsis;
-}
-
-
-.history-real {
-
-    color: #039855;
-
-    font-weight: bold;
-}
-
-
-.history-fake {
-
-    color: #d92d20;
-
-    font-weight: bold;
-}
-
-
-.clear-history-btn {
-
-    border:
-        1px solid #f04438;
-
-    background: white;
-
-    color: #d92d20;
-
-    padding: 7px 12px;
-
-    border-radius: 6px;
-
-    cursor: pointer;
-
-    font-size: 11px;
-
-    font-weight: bold;
-}
-
-
-/* ============================================================
-   FOOTER
-   ============================================================ */
-
-.footer {
-
-    text-align: center;
-
-    color: #98a2b3;
-
-    font-size: 11px;
-
-    margin-top: 35px;
-}
-
-
-/* ============================================================
-   RESPONSIVE
-   ============================================================ */
-
-@media (max-width: 1100px) {
-
-    .dashboard-grid {
-
-        grid-template-columns: 1fr;
-    }
-
-    .component-grid {
-
-        grid-template-columns:
-            repeat(2, minmax(0, 1fr));
-    }
-}
-
-
-@media (max-width: 750px) {
-
-    .sidebar {
-
-        width: 70px;
-
-        padding: 20px 10px;
-    }
-
-    .logo-text,
-    .logo-subtitle,
-    .nav-title,
-    .nav-item span,
-    .sidebar-bottom {
-
-        display: none;
-    }
-
-    .main {
-
-        margin-left: 70px;
-    }
-
-    .content {
-
-        padding: 20px 15px;
-    }
-
-    .component-grid {
-
-        grid-template-columns: 1fr;
-    }
-
-    .page-header {
-
-        flex-direction: column;
-
-        align-items: flex-start;
-    }
-
-    .input-footer {
-
-        flex-direction: column;
-
-        align-items: stretch;
-    }
-
-    .action-buttons {
-
-        width: 100%;
-    }
-
-    .action-buttons button {
-
-        flex: 1;
-    }
-}
-
-</style>
+    </style>
 
 </head>
 
@@ -1529,275 +1404,368 @@ td {
 <body>
 
 
-<!-- ============================================================
-     SIDEBAR
-     ============================================================ -->
+<!-- ========================================================
+     NAVBAR
+========================================================= -->
 
-<aside class="sidebar">
+<nav class="navbar navbar-expand-lg navbar-custom">
 
+    <div class="container-fluid px-4">
 
-    <div class="logo">
+        <a
+            class="navbar-brand d-flex align-items-center gap-3"
+            href="#"
+        >
 
-        <div class="logo-icon">
-            AI
-        </div>
+            <div class="brand-icon">
 
-        <div>
+                <i class="bi bi-shield-check"></i>
 
-            <div class="logo-text">
-                NewsGuard NLP
             </div>
 
-            <div class="logo-subtitle">
-                Fake News Detection
+            <div>
+
+                <div class="brand-title">
+                    NewsGuard AI
+                </div>
+
+                <div class="brand-subtitle">
+                    Fake News Detection
+                </div>
+
             </div>
 
-        </div>
-
-    </div>
+        </a>
 
 
-    <div class="nav-title">
-        Dashboard
-    </div>
+        <button
+            class="navbar-toggler"
+            type="button"
+            data-bs-toggle="collapse"
+            data-bs-target="#navbarNav"
+        >
+
+            <span class="navbar-toggler-icon"></span>
+
+        </button>
 
 
-    <div
-        class="nav-item active"
-        onclick="scrollToSection('analyzer')"
-    >
+        <div
+            class="collapse navbar-collapse"
+            id="navbarNav"
+        >
 
-        <div class="nav-icon">
-            01
-        </div>
+            <ul class="navbar-nav ms-auto align-items-lg-center">
 
-        <span>
-            News Analyzer
-        </span>
+                <li class="nav-item">
 
-    </div>
+                    <a
+                        class="nav-link"
+                        href="#dashboard"
+                    >
+                        Dashboard
+                    </a>
 
-
-    <div
-        class="nav-item"
-        onclick="scrollToSection('components')"
-    >
-
-        <div class="nav-icon">
-            02
-        </div>
-
-        <span>
-            System Components
-        </span>
-
-    </div>
+                </li>
 
 
-    <div
-        class="nav-item"
-        onclick="scrollToSection('history')"
-    >
+                <li class="nav-item">
 
-        <div class="nav-icon">
-            03
-        </div>
+                    <a
+                        class="nav-link"
+                        href="#history"
+                    >
+                        History
+                    </a>
 
-        <span>
-            Prediction History
-        </span>
-
-    </div>
+                </li>
 
 
-    <div
-        class="nav-item"
-        onclick="scrollToSection('model')"
-    >
+                <li class="nav-item">
 
-        <div class="nav-icon">
-            04
-        </div>
+                    <a
+                        class="nav-link"
+                        href="#about"
+                    >
+                        About
+                    </a>
 
-        <span>
-            Model Information
-        </span>
-
-    </div>
+                </li>
 
 
-    <div class="sidebar-bottom">
+                <li class="nav-item ms-lg-3 mt-2 mt-lg-0">
 
-        <div class="status-row">
+                    <span
+                        class="d-flex align-items-center gap-2
+                        small fw-bold text-success"
+                    >
 
-            <div class="status-dot"></div>
+                        <span class="online-dot"></span>
 
-            System Online
+                        AI Online
 
-        </div>
+                    </span>
 
-        <div class="status-text">
+                </li>
 
-            BERT model loaded
+            </ul>
 
         </div>
 
     </div>
 
+</nav>
 
-</aside>
 
-
-<!-- ============================================================
+<!-- ========================================================
      MAIN
-     ============================================================ -->
+========================================================= -->
 
-<main class="main">
-
-
-<header class="topbar">
-
-    <div class="breadcrumb">
-
-        Project /
-        <strong>Fake News Detection</strong>
-
-    </div>
+<main
+    class="main-container"
+    id="dashboard"
+>
 
 
-    <div class="top-status">
+    <!-- HERO -->
 
-        <div class="green-dot"></div>
-
-        AI model ready
-
-    </div>
-
-</header>
-
-
-<div class="content">
-
-
-    <!-- ========================================================
-         PAGE HEADER
-         ======================================================== -->
-
-    <div class="page-header">
+    <div class="d-flex flex-wrap
+                justify-content-between
+                align-items-end
+                gap-4
+                mb-4">
 
         <div>
 
-            <h1 class="page-title">
-
-                Fake News Detection Dashboard
-
+            <h1 class="hero-title">
+                AI-Powered Fake News Detection
             </h1>
 
+            <p class="hero-description mb-0">
 
-            <p class="page-description">
-
-                Analyze news content using Natural Language
-                Processing, BERT-based classification,
-                knowledge-guided linguistic analysis and
-                confidence scoring.
+                Analyze news using BERT,
+                Natural Language Processing,
+                and knowledge-guided linguistic analysis.
 
             </p>
 
         </div>
 
 
-        <div class="model-badge">
+        <div class="model-pill">
 
-            BERT + Knowledge + Progressive Training
+            <i class="bi bi-cpu"></i>
+
+            BERT + NLP + Knowledge
 
         </div>
 
     </div>
 
 
-    <!-- ========================================================
-         DASHBOARD GRID
-         ======================================================== -->
+    <!-- ====================================================
+         STATISTICS
+    ===================================================== -->
 
-    <div class="dashboard-grid">
-
-
-        <!-- ====================================================
-             LEFT COLUMN
-             ==================================================== -->
-
-        <div>
+    <div class="row g-3 mb-4">
 
 
-            <!-- NEWS ANALYZER -->
+        <div class="col-6 col-lg-3">
 
-            <section
-                class="card"
-                id="analyzer"
-            >
+            <div class="stat-card">
+
+                <div class="stat-icon icon-blue">
+
+                    <i class="bi bi-newspaper"></i>
+
+                </div>
+
+                <div class="stat-label">
+                    Articles
+                </div>
+
+                <div
+                    class="stat-value"
+                    id="totalArticles"
+                >
+                    0
+                </div>
+
+            </div>
+
+        </div>
 
 
-                <div class="card-header">
+        <div class="col-6 col-lg-3">
 
-                    <div>
+            <div class="stat-card">
 
-                        <div class="card-title">
+                <div class="stat-icon icon-green">
 
-                            News Content Analyzer
+                    <i class="bi bi-check-circle"></i>
 
-                        </div>
+                </div>
 
-                        <div class="card-subtitle">
+                <div class="stat-label">
+                    Real
+                </div>
 
-                            Paste article content or upload a
-                            .txt file
+                <div
+                    class="stat-value text-success"
+                    id="realArticles"
+                >
+                    0
+                </div>
 
-                        </div>
+            </div>
+
+        </div>
+
+
+        <div class="col-6 col-lg-3">
+
+            <div class="stat-card">
+
+                <div class="stat-icon icon-red">
+
+                    <i class="bi bi-exclamation-triangle"></i>
+
+                </div>
+
+                <div class="stat-label">
+                    Fake
+                </div>
+
+                <div
+                    class="stat-value text-danger"
+                    id="fakeArticles"
+                >
+                    0
+                </div>
+
+            </div>
+
+        </div>
+
+
+        <div class="col-6 col-lg-3">
+
+            <div class="stat-card">
+
+                <div class="stat-icon icon-orange">
+
+                    <i class="bi bi-graph-up"></i>
+
+                </div>
+
+                <div class="stat-label">
+                    Model Accuracy
+                </div>
+
+                <div
+                    class="stat-value"
+                    id="modelAccuracy"
+                >
+                    Loading...
+                </div>
+
+            </div>
+
+        </div>
+
+    </div>
+
+
+    <!-- ====================================================
+         ANALYZER + MODEL STATUS
+    ===================================================== -->
+
+    <div
+        class="row g-4 mb-4"
+        id="analyzer"
+    >
+
+
+        <!-- NEWS ANALYZER -->
+
+        <div class="col-lg-8">
+
+            <div class="dashboard-card">
+
+                <div class="card-header-custom">
+
+                    <div class="card-title-custom">
+
+                        <i class="bi bi-file-earmark-text
+                                  me-2 text-primary"></i>
+
+                        News Analyzer
+
+                    </div>
+
+                    <div class="card-subtitle-custom">
+
+                        Paste an article or upload a
+                        .txt file for analysis.
 
                     </div>
 
                 </div>
 
 
-                <div class="card-body">
+                <div class="card-body-custom">
 
 
                     <textarea
                         id="newsText"
-                        placeholder="Paste the news article here for analysis..."
+                        class="news-textarea"
+                        placeholder="Paste your news article here for analysis..."
                     ></textarea>
 
 
-                    <div class="input-footer">
+                    <div
+                        class="d-flex flex-wrap
+                               justify-content-between
+                               align-items-center
+                               gap-3
+                               mt-3"
+                    >
 
 
-                        <div class="file-upload">
+                        <div>
 
-                            <button
-                                class="secondary-btn"
-                                type="button"
+                            <label
+                                class="btn btn-secondary-custom"
                             >
-                                Upload .txt File
-                            </button>
 
+                                <i
+                                    class="bi bi-upload me-1"
+                                ></i>
 
-                            <input
-                                type="file"
-                                id="fileInput"
-                                accept=".txt"
-                            >
+                                Upload .txt
+
+                                <input
+                                    type="file"
+                                    id="fileInput"
+                                    accept=".txt"
+                                    hidden
+                                >
+
+                            </label>
 
                         </div>
 
 
-                        <div class="action-buttons">
-
+                        <div class="d-flex gap-2">
 
                             <button
-                                class="secondary-btn"
-                                type="button"
+                                class="btn btn-secondary-custom"
                                 onclick="clearText()"
                             >
+
+                                <i
+                                    class="bi bi-x-circle me-1"
+                                ></i>
 
                                 Clear
 
@@ -1805,16 +1773,22 @@ td {
 
 
                             <button
-                                class="primary-btn"
+                                class="btn btn-primary-custom"
                                 id="analyzeBtn"
-                                type="button"
                                 onclick="analyzeNews()"
                             >
 
+                                <i
+                                    class="bi bi-stars me-1"
+                                ></i>
+
                                 Analyze News
 
-                            </button>
+                                <i
+                                    class="bi bi-arrow-right ms-1"
+                                ></i>
 
+                            </button>
 
                         </div>
 
@@ -1822,47 +1796,197 @@ td {
 
 
                     <div
-                        class="loading"
+                        class="loading-container"
                         id="loading"
                     >
 
-                        <div class="spinner"></div>
+                        <div
+                            class="spinner-border
+                                   spinner-border-sm"
+                        ></div>
 
                         Analyzing article with BERT...
+
+                    </div>
+
+                </div>
+
+            </div>
+
+        </div>
+
+
+        <!-- MODEL STATUS -->
+
+        <div class="col-lg-4">
+
+            <div class="dashboard-card">
+
+                <div class="card-header-custom">
+
+                    <div class="card-title-custom">
+
+                        <i
+                            class="bi bi-cpu me-2 text-primary"
+                        ></i>
+
+                        Model Status
+
+                    </div>
+
+                    <div class="card-subtitle-custom">
+
+                        Current AI configuration
+
+                    </div>
+
+                </div>
+
+
+                <div class="card-body-custom">
+
+
+                    <div class="status-box">
+
+                        <div class="status-indicator"></div>
+
+                        <div>
+
+                            <div class="status-title">
+                                BERT Model Ready
+                            </div>
+
+                            <div class="status-description">
+                                System is ready for prediction
+                            </div>
+
+                        </div>
+
+                    </div>
+
+
+                    <div class="info-row">
+
+                        <span class="info-label">
+                            Dataset
+                        </span>
+
+                        <span class="info-value">
+                            WELFake
+                        </span>
+
+                    </div>
+
+
+                    <div class="info-row">
+
+                        <span class="info-label">
+                            Dataset Size
+                        </span>
+
+                        <span class="info-value">
+                            72,134
+                        </span>
+
+                    </div>
+
+
+                    <div class="info-row">
+
+                        <span class="info-label">
+                            Model
+                        </span>
+
+                        <span class="info-value">
+                            BERT
+                        </span>
+
+                    </div>
+
+
+                    <div class="info-row">
+
+                        <span class="info-label">
+                            Knowledge
+                        </span>
+
+                        <span class="info-value text-success">
+                            Enabled
+                        </span>
+
+                    </div>
+
+
+                    <div class="info-row">
+
+                        <span class="info-label">
+                            Training
+                        </span>
+
+                        <span class="info-value">
+                            Progressive
+                        </span>
+
+                    </div>
+
+
+                    <div class="info-row">
+
+                        <span class="info-label">
+                            Test Accuracy
+                        </span>
+
+                        <span
+                            class="info-value text-success"
+                            id="modelAccuracyStatus"
+                        >
+                            Loading...
+                        </span>
 
                     </div>
 
 
                 </div>
 
-            </section>
+            </div>
+
+        </div>
+
+    </div>
 
 
-            <!-- =================================================
-                 RESULT
-                 ================================================= -->
+    <!-- ====================================================
+         RESULT + CONFIDENCE
+    ===================================================== -->
 
-            <section
-                class="card"
-                style="margin-top:22px;"
-            >
+    <div
+        class="row g-4 mb-4"
+        id="resultSection"
+    >
 
 
-                <div class="card-header">
+        <!-- RESULT -->
 
-                    <div>
+        <div class="col-lg-7">
 
-                        <div class="card-title">
+            <div class="dashboard-card">
 
-                            Analysis Result
+                <div class="card-header-custom">
 
-                        </div>
+                    <div class="card-title-custom">
 
-                        <div class="card-subtitle">
+                        <i
+                            class="bi bi-clipboard2-data
+                                   me-2 text-primary"
+                        ></i>
 
-                            Classification and confidence analysis
+                        Analysis Result
 
-                        </div>
+                    </div>
+
+                    <div class="card-subtitle-custom">
+
+                        Classification and linguistic analysis
 
                     </div>
 
@@ -1870,645 +1994,517 @@ td {
 
 
                 <div
-                    class="result-area"
+                    class="card-body-custom"
                     id="resultArea"
                 >
 
-                    <div class="empty-result">
+                    <div class="result-placeholder">
 
-                        Enter news content above and click
-                        <strong>Analyze News</strong>.
+                        <div class="result-icon">
+
+                            <i class="bi bi-search"></i>
+
+                        </div>
+
+                        <h6 class="fw-bold">
+                            No analysis yet
+                        </h6>
+
+                        <p class="small mb-0">
+                            Enter news content above and
+                            click Analyze News.
+                        </p>
 
                     </div>
 
                 </div>
 
-
-            </section>
-
-
-            <!-- =================================================
-                 COMPONENTS
-                 ================================================= -->
-
-            <section
-                class="card components-card"
-                id="components"
-            >
-
-
-                <div class="card-header">
-
-                    <div>
-
-                        <div class="card-title">
-
-                            System Components
-
-                        </div>
-
-                        <div class="card-subtitle">
-
-                            Detection pipeline components
-
-                        </div>
-
-                    </div>
-
-                </div>
-
-
-                <div class="card-body">
-
-
-                    <div class="component-grid">
-
-
-                        <button
-                            class="component-btn active"
-                            type="button"
-                            onclick="showComponent(1, this)"
-                        >
-
-                            <div class="component-number">
-                                COMPONENT 01
-                            </div>
-
-                            <div class="component-name">
-                                NLP Preprocessing
-                            </div>
-
-                            <div class="component-short">
-                                Cleans and prepares news text.
-                            </div>
-
-                        </button>
-
-
-                        <button
-                            class="component-btn"
-                            type="button"
-                            onclick="showComponent(2, this)"
-                        >
-
-                            <div class="component-number">
-                                COMPONENT 02
-                            </div>
-
-                            <div class="component-name">
-                                BERT Classification
-                            </div>
-
-                            <div class="component-short">
-                                Learns contextual language patterns.
-                            </div>
-
-                        </button>
-
-
-                        <button
-                            class="component-btn"
-                            type="button"
-                            onclick="showComponent(3, this)"
-                        >
-
-                            <div class="component-number">
-                                COMPONENT 03
-                            </div>
-
-                            <div class="component-name">
-                                Knowledge Analysis
-                            </div>
-
-                            <div class="component-short">
-                                Detects suspicious language signals.
-                            </div>
-
-                        </button>
-
-
-                        <button
-                            class="component-btn"
-                            type="button"
-                            onclick="showComponent(4, this)"
-                        >
-
-                            <div class="component-number">
-                                COMPONENT 04
-                            </div>
-
-                            <div class="component-name">
-                                Confidence Analysis
-                            </div>
-
-                            <div class="component-short">
-                                Provides prediction probability.
-                            </div>
-
-                        </button>
-
-
-                    </div>
-
-
-                    <div
-                        class="component-details show"
-                        id="componentDetails"
-                    >
-
-                        <div
-                            class="details-title"
-                            id="detailsTitle"
-                        >
-                            NLP Preprocessing
-                        </div>
-
-
-                        <div
-                            class="details-text"
-                            id="detailsText"
-                        >
-
-                            The news article is cleaned and prepared
-                            before being passed to the BERT tokenizer
-                            and classification model.
-
-                        </div>
-
-                    </div>
-
-
-                </div>
-
-            </section>
-
-
-            <!-- =================================================
-                 HISTORY
-                 ================================================= -->
-
-            <section
-                class="card history-card"
-                id="history"
-            >
-
-
-                <div class="card-header">
-
-                    <div>
-
-                        <div class="card-title">
-                            Prediction History
-                        </div>
-
-                        <div class="card-subtitle">
-                            Recently analyzed news articles
-                        </div>
-
-                    </div>
-
-
-                    <button
-                        class="clear-history-btn"
-                        type="button"
-                        onclick="clearHistory()"
-                    >
-
-                        Clear History
-
-                    </button>
-
-                </div>
-
-
-                <div class="history-table-wrapper">
-
-                    <table>
-
-                        <thead>
-
-                            <tr>
-
-                                <th>
-                                    Date
-                                </th>
-
-                                <th>
-                                    News
-                                </th>
-
-                                <th>
-                                    Prediction
-                                </th>
-
-                                <th>
-                                    Confidence
-                                </th>
-
-                            </tr>
-
-                        </thead>
-
-
-                        <tbody id="historyBody">
-
-                        </tbody>
-
-                    </table>
-
-                </div>
-
-
-            </section>
-
+            </div>
 
         </div>
 
 
-        <!-- ====================================================
-             RIGHT COLUMN
-             ==================================================== -->
+        <!-- CONFIDENCE -->
 
-        <div class="right-stack">
+        <div class="col-lg-5">
 
+            <div class="dashboard-card">
 
-            <!-- MODEL INFORMATION -->
+                <div class="card-header-custom">
 
-            <section
-                class="card"
-                id="model"
-            >
+                    <div class="card-title-custom">
 
+                        <i
+                            class="bi bi-speedometer2
+                                   me-2 text-primary"
+                        ></i>
 
-                <div class="card-header">
+                        AI Confidence
 
-                    <div>
+                    </div>
 
-                        <div class="card-title">
-                            Model Information
-                        </div>
+                    <div class="card-subtitle-custom">
 
-                        <div class="card-subtitle">
-                            Current AI configuration
-                        </div>
+                        Prediction probability
 
                     </div>
 
                 </div>
 
 
-                <div class="card-body">
+                <div
+                    class="card-body-custom text-center"
+                    id="confidenceArea"
+                >
 
+                    <div class="result-placeholder">
 
-                    <div class="info-list">
+                        <div class="result-icon">
 
-
-                        <div class="info-row">
-
-                            <div class="info-label">
-                                Dataset
-                            </div>
-
-                            <div class="info-value">
-                                WELFake
-                            </div>
+                            <i class="bi bi-bar-chart"></i>
 
                         </div>
 
-
-                        <div class="info-row">
-
-                            <div class="info-label">
-                                Dataset Size
-                            </div>
-
-                            <div class="info-value">
-                                72,134
-                            </div>
-
-                        </div>
-
-
-                        <div class="info-row">
-
-                            <div class="info-label">
-                                Model
-                            </div>
-
-                            <div class="info-value">
-                                BERT
-                            </div>
-
-                        </div>
-
-
-                        <div class="info-row">
-
-                            <div class="info-label">
-                                Training
-                            </div>
-
-                            <div class="info-value">
-                                Progressive
-                            </div>
-
-                        </div>
-
-
-                        <div class="info-row">
-
-                            <div class="info-label">
-                                Classification
-                            </div>
-
-                            <div class="info-value">
-                                Real / Fake
-                            </div>
-
-                        </div>
-
+                        <p class="small mb-0">
+                            Confidence will appear here
+                            after analysis.
+                        </p>
 
                     </div>
 
                 </div>
 
-            </section>
-
-
-            <!-- ACCURACY -->
-
-            <section class="card stat-card">
-
-                <div class="stat-label">
-
-                    Model Test Accuracy
-
-                </div>
-
-
-                <div class="stat-value">
-
-                    94.75%
-
-                </div>
-
-
-                <div class="stat-description">
-
-                    Current experiment
-
-                </div>
-
-            </section>
-
-
-            <!-- PIPELINE -->
-
-            <section class="card">
-
-
-                <div class="card-header">
-
-                    <div>
-
-                        <div class="card-title">
-                            Detection Pipeline
-                        </div>
-
-                        <div class="card-subtitle">
-                            Processing workflow
-                        </div>
-
-                    </div>
-
-                </div>
-
-
-                <div class="card-body">
-
-
-                    <div class="info-list">
-
-
-                        <div class="info-row">
-
-                            <div class="info-label">
-                                01
-                            </div>
-
-                            <div class="info-value">
-                                Input News
-                            </div>
-
-                        </div>
-
-
-                        <div class="info-row">
-
-                            <div class="info-label">
-                                02
-                            </div>
-
-                            <div class="info-value">
-                                Text Processing
-                            </div>
-
-                        </div>
-
-
-                        <div class="info-row">
-
-                            <div class="info-label">
-                                03
-                            </div>
-
-                            <div class="info-value">
-                                BERT Tokenization
-                            </div>
-
-                        </div>
-
-
-                        <div class="info-row">
-
-                            <div class="info-label">
-                                04
-                            </div>
-
-                            <div class="info-value">
-                                Knowledge Analysis
-                            </div>
-
-                        </div>
-
-
-                        <div class="info-row">
-
-                            <div class="info-label">
-                                05
-                            </div>
-
-                            <div class="info-value">
-                                Classification
-                            </div>
-
-                        </div>
-
-
-                        <div class="info-row">
-
-                            <div class="info-label">
-                                06
-                            </div>
-
-                            <div class="info-value">
-                                Confidence Score
-                            </div>
-
-                        </div>
-
-
-                    </div>
-
-                </div>
-
-            </section>
-
+            </div>
 
         </div>
 
     </div>
 
 
-    <div class="footer">
+    <!-- ====================================================
+         DETECTION PIPELINE
+    ===================================================== -->
 
-        Fake News Detection Using NLP |
-        BERT-based research prototype
+    <div class="dashboard-card mb-4">
+
+        <div class="card-header-custom">
+
+            <div class="card-title-custom">
+
+                <i
+                    class="bi bi-diagram-3
+                           me-2 text-primary"
+                ></i>
+
+                Detection Pipeline
+
+            </div>
+
+            <div class="card-subtitle-custom">
+
+                Processing workflow used by the system
+
+            </div>
+
+        </div>
+
+
+        <div class="card-body-custom">
+
+            <div class="pipeline">
+
+
+                <div class="pipeline-step">
+
+                    <div class="pipeline-number">
+                        01
+                    </div>
+
+                    <div class="pipeline-title">
+                        Input News
+                    </div>
+
+                </div>
+
+
+                <div class="pipeline-arrow">
+                    →
+                </div>
+
+
+                <div class="pipeline-step">
+
+                    <div class="pipeline-number">
+                        02
+                    </div>
+
+                    <div class="pipeline-title">
+                        NLP
+                    </div>
+
+                </div>
+
+
+                <div class="pipeline-arrow">
+                    →
+                </div>
+
+
+                <div class="pipeline-step">
+
+                    <div class="pipeline-number">
+                        03
+                    </div>
+
+                    <div class="pipeline-title">
+                        Tokenization
+                    </div>
+
+                </div>
+
+
+                <div class="pipeline-arrow">
+                    →
+                </div>
+
+
+                <div class="pipeline-step">
+
+                    <div class="pipeline-number">
+                        04
+                    </div>
+
+                    <div class="pipeline-title">
+                        BERT
+                    </div>
+
+                </div>
+
+
+                <div class="pipeline-arrow">
+                    →
+                </div>
+
+
+                <div class="pipeline-step">
+
+                    <div class="pipeline-number">
+                        05
+                    </div>
+
+                    <div class="pipeline-title">
+                        Knowledge
+                    </div>
+
+                </div>
+
+
+                <div class="pipeline-arrow">
+                    →
+                </div>
+
+
+                <div class="pipeline-step">
+
+                    <div class="pipeline-number">
+                        06
+                    </div>
+
+                    <div class="pipeline-title">
+                        Prediction
+                    </div>
+
+                </div>
+
+
+            </div>
+
+        </div>
 
     </div>
 
 
-</div>
+    <!-- ====================================================
+         HISTORY
+    ===================================================== -->
+
+    <div
+        class="dashboard-card mb-4"
+        id="history"
+    >
+
+        <div
+            class="card-header-custom
+                   d-flex
+                   justify-content-between
+                   align-items-center
+                   flex-wrap
+                   gap-3"
+        >
+
+            <div>
+
+                <div class="card-title-custom">
+
+                    <i
+                        class="bi bi-clock-history
+                               me-2 text-primary"
+                    ></i>
+
+                    Recent Predictions
+
+                </div>
+
+                <div class="card-subtitle-custom">
+
+                    Latest analyzed news articles
+
+                </div>
+
+            </div>
+
+
+            <button
+                class="btn btn-secondary-custom"
+                onclick="clearHistory()"
+            >
+
+                <i
+                    class="bi bi-trash3 me-1"
+                ></i>
+
+                Clear History
+
+            </button>
+
+        </div>
+
+
+        <div class="table-wrapper">
+
+            <table
+                class="table history-table"
+            >
+
+                <thead>
+
+                    <tr>
+
+                        <th>
+                            Date
+                        </th>
+
+                        <th>
+                            Article
+                        </th>
+
+                        <th>
+                            Result
+                        </th>
+
+                        <th>
+                            Confidence
+                        </th>
+
+                    </tr>
+
+                </thead>
+
+
+                <tbody id="historyBody">
+
+                </tbody>
+
+            </table>
+
+        </div>
+
+    </div>
+
+
+    <!-- ====================================================
+         ABOUT
+    ===================================================== -->
+
+    <div
+        class="dashboard-card mb-4"
+        id="about"
+    >
+
+        <div class="card-header-custom">
+
+            <div class="card-title-custom">
+
+                <i
+                    class="bi bi-info-circle
+                           me-2 text-primary"
+                ></i>
+
+                About NewsGuard AI
+
+            </div>
+
+        </div>
+
+
+        <div class="card-body-custom">
+
+            <p class="text-secondary mb-2">
+
+                NewsGuard AI is a research prototype
+                for fake-news classification using
+                Natural Language Processing and
+                BERT-based text classification.
+
+            </p>
+
+            <p class="text-secondary mb-0">
+
+                The system combines BERT predictions
+                with knowledge-guided linguistic signals
+                to provide additional supporting analysis.
+
+            </p>
+
+        </div>
+
+    </div>
 
 </main>
 
 
+<!-- ========================================================
+     FOOTER
+========================================================= -->
+
+<footer>
+
+    <div class="container text-center">
+
+        <div class="fw-bold mb-1">
+            NewsGuard AI
+        </div>
+
+        <div>
+            Fake News Detection Using NLP |
+            BERT-based Research Prototype
+        </div>
+
+    </div>
+
+</footer>
+
+
+<!-- ========================================================
+     JAVASCRIPT
+========================================================= -->
+
+<script
+    src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"
+></script>
+
+
 <script>
 
-/* ============================================================
-   FILE UPLOAD
-   ============================================================ */
 
-const newsText =
-    document.getElementById("newsText");
+// ==========================================================
+// FILE UPLOAD
+// ==========================================================
 
-const fileInput =
-    document.getElementById("fileInput");
+document
+    .getElementById("fileInput")
+    .addEventListener(
+        "change",
+        function(event) {
 
+            const file =
+                event.target.files[0];
 
-fileInput.addEventListener(
-    "change",
-    function () {
+            if (!file) {
+                return;
+            }
 
-        const file = this.files[0];
+            const reader =
+                new FileReader();
 
-        if (!file) {
-            return;
+            reader.onload =
+                function(e) {
+
+                    document
+                        .getElementById(
+                            "newsText"
+                        )
+                        .value =
+                        e.target.result;
+
+                };
+
+            reader.readAsText(file);
         }
-
-
-        if (
-            !file.name
-                .toLowerCase()
-                .endsWith(".txt")
-        ) {
-
-            alert(
-                "Please select a .txt file."
-            );
-
-            this.value = "";
-
-            return;
-        }
-
-
-        const reader =
-            new FileReader();
-
-
-        reader.onload =
-            function (event) {
-
-                newsText.value =
-                    event.target.result;
-
-            };
-
-
-        reader.onerror =
-            function () {
-
-                alert(
-                    "Unable to read the file."
-                );
-
-            };
-
-
-        reader.readAsText(file);
-
-    }
-);
-
-
-/* ============================================================
-   ANALYZE NEWS
-   ============================================================ */
-
-async function analyzeNews() {
-
-    console.log(
-        "Analyze button clicked"
     );
 
 
+// ==========================================================
+// CLEAR TEXT
+// ==========================================================
+
+function clearText() {
+
+    document
+        .getElementById(
+            "newsText"
+        )
+        .value = "";
+
+    document
+        .getElementById(
+            "fileInput"
+        )
+        .value = "";
+
+}
+
+
+// ==========================================================
+// ANALYZE NEWS
+// ==========================================================
+
+async function analyzeNews() {
+
     const text =
-        newsText.value.trim();
-
-
-    const button =
-        document.getElementById(
-            "analyzeBtn"
-        );
-
-
-    const loading =
-        document.getElementById(
-            "loading"
-        );
-
-
-    const resultArea =
-        document.getElementById(
-            "resultArea"
-        );
+        document
+            .getElementById(
+                "newsText"
+            )
+            .value
+            .trim();
 
 
     if (!text) {
 
         alert(
-            "Please enter a news article."
+            "Please enter or upload a news article."
         );
 
         return;
     }
 
 
-    button.disabled = true;
+    const button =
+        document
+            .getElementById(
+                "analyzeBtn"
+            );
 
-    button.innerText =
-        "Analyzing...";
+
+    const loading =
+        document
+            .getElementById(
+                "loading"
+            );
+
+
+    button.disabled = true;
 
     loading.style.display =
         "flex";
@@ -2539,18 +2535,13 @@ async function analyzeNews() {
             await response.json();
 
 
-        console.log(
-            "Server response:",
-            data
-        );
-
-
         if (!response.ok) {
 
             throw new Error(
                 data.error ||
                 "Prediction failed."
             );
+
         }
 
 
@@ -2558,201 +2549,194 @@ async function analyzeNews() {
 
         loadHistory();
 
+        loadStatistics();
+
+
+        document
+            .getElementById(
+                "resultSection"
+            )
+            .scrollIntoView({
+                behavior: "smooth"
+            });
+
+
     }
+    catch(error) {
 
-
-    catch (error) {
-
-        console.error(
-            "Prediction error:",
-            error
+        alert(
+            "Error: " +
+            error.message
         );
 
-
-        resultArea.innerHTML = `
-
-            <div class="empty-result">
-
-                <strong style="color:#d92d20;">
-                    Error
-                </strong>
-
-                <br><br>
-
-                ${escapeHTML(error.message)}
-
-            </div>
-
-        `;
-
     }
-
-
     finally {
 
         button.disabled = false;
 
-        button.innerText =
-            "Analyze News";
-
         loading.style.display =
             "none";
+
     }
+
 }
 
 
-/* ============================================================
-   DISPLAY RESULT
-   ============================================================ */
+// ==========================================================
+// DISPLAY RESULT
+// ==========================================================
 
 function displayResult(data) {
 
-    const resultArea =
-        document.getElementById(
-            "resultArea"
-        );
-
-
     const prediction =
         String(
-            data.prediction ||
-            "Unknown"
+            data.prediction || ""
         );
 
 
-    let confidence =
+    const confidence =
         Number(
             data.confidence || 0
         );
 
 
-    if (
-        confidence >= 0 &&
-        confidence <= 1
-    ) {
-
-        confidence =
-            confidence * 100;
-    }
+    const isFake =
+        prediction.toLowerCase()
+            .includes("fake");
 
 
-    confidence =
-        Math.max(
-            0,
-            Math.min(
-                100,
-                confidence
-            )
+    const resultArea =
+        document
+            .getElementById(
+                "resultArea"
+            );
+
+
+    const confidenceArea =
+        document
+            .getElementById(
+                "confidenceArea"
+            );
+
+
+    // ------------------------------------------------------
+    // SEPARATE WARNING LAYER
+    // ------------------------------------------------------
+
+    const warningLayer =
+        data.warning_layer || data.explanation || {};
+
+    const warningItems =
+        Array.isArray(warningLayer.items)
+            ? warningLayer.items
+            : [];
+
+    const warningStatus =
+        String(
+            warningLayer.status ||
+            (warningItems.length
+                ? "Warning patterns found"
+                : "No listed warning patterns found")
         );
 
+    const warningBorder =
+        warningItems.length ? "#f59e0b" : "#9ca3af";
 
-    const predictionClass =
-        prediction
-            .toLowerCase()
-            .includes("fake")
-            ? "fake"
-            : "real";
+    let signalsHTML = `
+        <div class="mt-4 p-3 rounded-3"
+             style="border:1px solid #e5e7eb;border-left:4px solid ${warningBorder};background:#fff;">
+            <div class="d-flex align-items-start gap-2 mb-2">
+                <i class="bi bi-shield-exclamation text-warning fs-5"></i>
+                <div>
+                    <div class="fw-bold">Separate Warning Layer</div>
+                    <div class="small text-secondary">${escapeHtml(warningStatus)}</div>
+                </div>
+            </div>
+    `;
 
+    if (warningItems.length) {
+        signalsHTML += `<div class="mt-2">`;
 
-    let keywordsHTML = "";
+        warningItems.forEach(function(item) {
+            signalsHTML += `
+                <span class="signal-badge"
+                      title="Matched phrase: ${escapeHtml(item.phrase || "")}">
+                    ${escapeHtml(item.category || "Warning signal")}
+                    <span class="text-secondary">· ${escapeHtml(item.phrase || "")}</span>
+                </span>
+            `;
+        });
 
-
-    if (
-        data.explanation &&
-        Array.isArray(
-            data.explanation.items
-        )
-    ) {
-
-        data.explanation.items.forEach(
-            function (item) {
-
-                keywordsHTML += `
-
-                    <div class="keyword">
-
-                        <span
-                            class="keyword-category"
-                        >
-                            ${escapeHTML(
-                                item.category
-                            )}
-                        </span>
-
-                        <span
-                            class="keyword-word"
-                        >
-                            ${escapeHTML(
-                                item.phrase
-                            )}
-                        </span>
-
-                    </div>
-
-                `;
-
-            }
-        );
+        signalsHTML += `</div>`;
+    } else {
+        signalsHTML += `
+            <div class="small text-secondary mt-2">
+                No patterns from the current warning rules were found. This does not mean the article is true.
+            </div>
+        `;
     }
 
-
-    let message =
-        "No explanation available.";
-
-
-    if (
-        data.explanation &&
-        data.explanation.message
-    ) {
-
-        message =
-            data.explanation.message;
-    }
+    signalsHTML += `
+            <div class="small text-secondary mt-3">
+                ${escapeHtml(warningLayer.message || "Warning signals are not proof of factual accuracy.")}
+            </div>
+        </div>
+    `;
 
 
-    resultArea.innerHTML = `
+    // ------------------------------------------------------
+    // RESULT CARD
+    // ------------------------------------------------------
 
-        <div class="result-content">
+    resultArea.innerHTML =
+        `
+        <div>
 
+            <div
+                class="prediction-badge
+                ${
+                    isFake
+                        ? "prediction-fake"
+                        : "prediction-real"
+                }"
+            >
 
-            <div class="result-label">
+                <i
+                    class="bi
+                    ${
+                        isFake
+                            ? "bi-exclamation-triangle"
+                            : "bi-check-circle"
+                    }"
+                ></i>
 
-                Classification Result
+                ${
+                    isFake
+                        ? "POSSIBLY FAKE"
+                        : "POSSIBLY REAL"
+                }
 
             </div>
 
 
-            <div
-                class="prediction ${predictionClass}"
-            >
-
-                ${escapeHTML(
-                    prediction
-                )}
-
-            </div>
-
-
-            <div
-                class="confidence-wrapper"
-            >
-
+            <div class="mt-4">
 
                 <div
-                    class="confidence-top"
+                    class="d-flex
+                           justify-content-between
+                           mb-2"
                 >
 
-                    <span>
+                    <span
+                        class="small fw-bold"
+                    >
                         Model Confidence
                     </span>
 
-
                     <span
-                        class="confidence-value"
+                        class="small fw-bold"
                     >
-
-                        ${confidence.toFixed(2)}%
-
+                        ${confidence.toFixed(1)}%
                     </span>
 
                 </div>
@@ -2761,87 +2745,149 @@ function displayResult(data) {
                 <div class="progress">
 
                     <div
-                        class="progress-bar"
-                        style="width:${confidence}%"
-                    >
-                    </div>
+                        class="progress-bar
+                        ${
+                            isFake
+                                ? "bg-danger"
+                                : "bg-success"
+                        }"
+                        style="
+                            width:
+                            ${confidence}%
+                        "
+                    ></div>
 
                 </div>
-
 
             </div>
 
 
-            <div class="explanation">
-
+            <div
+                class="mt-4
+                       p-3
+                       rounded-3
+                       bg-light"
+            >
 
                 <div
-                    class="explanation-title"
+                    class="small text-secondary"
                 >
-
-                    Linguistic Explanation
-
+                    Final Prediction
                 </div>
 
+                <div
+                    class="fs-4 fw-bold
+                    ${
+                        isFake
+                            ? "text-danger"
+                            : "text-success"
+                    }"
+                >
+                    ${escapeHtml(
+                        prediction.toUpperCase()
+                    )}
+                </div>
+
+            </div>
+
+
+            ${signalsHTML}
+
+        </div>
+        `;
+
+
+    // ------------------------------------------------------
+    // CONFIDENCE CARD
+    // ------------------------------------------------------
+
+    confidenceArea.innerHTML =
+        `
+        <div
+            class="d-flex
+                   flex-column
+                   align-items-center
+                   justify-content-center"
+            style="min-height:300px"
+        >
+
+            <div
+                class="confidence-number
+                ${
+                    isFake
+                        ? "text-danger"
+                        : "text-success"
+                }"
+            >
+                ${confidence.toFixed(1)}%
+            </div>
+
+            <div
+                class="confidence-label mb-4"
+            >
+                AI Model Confidence
+            </div>
+
+
+            <div
+                class="progress w-100"
+                style="max-width:320px;height:14px"
+            >
 
                 <div
-                    class="explanation-message"
+                    class="progress-bar
+                    ${
+                        isFake
+                            ? "bg-danger"
+                            : "bg-success"
+                    }"
+                    style="
+                        width:
+                        ${confidence}%
+                    "
+                ></div>
+
+            </div>
+
+
+            <div class="mt-4">
+
+                <span
+                    class="prediction-badge
+                    ${
+                        isFake
+                            ? "prediction-fake"
+                            : "prediction-real"
+                    }"
                 >
 
-                    ${escapeHTML(
-                        message
+                    <i
+                        class="bi
+                        ${
+                            isFake
+                                ? "bi-x-circle"
+                                : "bi-check-circle"
+                        }"
+                    ></i>
+
+                    Prediction:
+                    ${escapeHtml(
+                        prediction.toUpperCase()
                     )}
 
-                </div>
-
-
-                <div
-                    class="keyword-list"
-                >
-
-                    ${keywordsHTML}
-
-                </div>
-
+                </span>
 
             </div>
 
-
         </div>
+        `;
 
-    `;
 }
 
 
-/* ============================================================
-   CLEAR TEXT
-   ============================================================ */
-
-function clearText() {
-
-    newsText.value = "";
-
-    fileInput.value = "";
-
-
-    document.getElementById(
-        "resultArea"
-    ).innerHTML = `
-
-        <div class="empty-result">
-
-            Enter news content above and click
-            <strong>Analyze News</strong>.
-
-        </div>
-
-    `;
-}
-
-
-/* ============================================================
-   LOAD HISTORY
-   ============================================================ */
+// ==========================================================
+// LOAD HISTORY
+// ==========================================================
 
 async function loadHistory() {
 
@@ -2857,10 +2903,14 @@ async function loadHistory() {
             await response.json();
 
 
-        const body =
-            document.getElementById(
-                "historyBody"
-            );
+        const tbody =
+            document
+                .getElementById(
+                    "historyBody"
+                );
+
+
+        tbody.innerHTML = "";
 
 
         if (
@@ -2868,114 +2918,108 @@ async function loadHistory() {
             data.history.length === 0
         ) {
 
-            body.innerHTML = `
-
+            tbody.innerHTML =
+                `
                 <tr>
 
                     <td
                         colspan="4"
-                        style="
-                            text-align:center;
-                            color:#98a2b3;
-                            padding:25px;
-                        "
+                        class="text-center
+                               text-secondary
+                               py-5"
                     >
 
-                        No prediction history available.
+                        No predictions yet.
 
                     </td>
 
                 </tr>
-
-            `;
+                `;
 
             return;
         }
 
 
-        body.innerHTML =
-            data.history
-                .map(
-                    function (item) {
+        data.history.forEach(
+            function(item) {
 
-                        const isReal =
-                            String(
-                                item.prediction
-                            )
-                            .toLowerCase()
-                            .includes("real");
+                const isFake =
+                    String(
+                        item.prediction
+                    )
+                    .toLowerCase()
+                    .includes("fake");
 
 
-                        return `
-
-                            <tr>
-
-                                <td>
-
-                                    ${escapeHTML(
-                                        item.created_at
-                                    )}
-
-                                </td>
+                const row =
+                    document.createElement(
+                        "tr"
+                    );
 
 
-                                <td>
+                row.innerHTML =
+                    `
+                    <td>
+                        ${escapeHtml(
+                            item.created_at
+                        )}
+                    </td>
 
-                                    <div
-                                        class="news-preview"
-                                        title="${escapeHTML(
-                                            item.news_text
-                                        )}"
-                                    >
+                    <td>
 
-                                        ${escapeHTML(
-                                            item.news_text
-                                        )}
+                        <div
+                            class="article-preview"
+                            title="${escapeHtml(
+                                item.news_text
+                            )}"
+                        >
+                            ${escapeHtml(
+                                item.news_text
+                            )}
+                        </div>
 
-                                    </div>
+                    </td>
 
-                                </td>
+                    <td>
+
+                        <span
+                            class="table-result
+                            ${
+                                isFake
+                                    ? "table-fake"
+                                    : "table-real"
+                            }"
+                        >
+
+                            ${
+                                isFake
+                                    ? "FAKE"
+                                    : "REAL"
+                            }
+
+                        </span>
+
+                    </td>
+
+                    <td>
+
+                        <strong>
+                            ${Number(
+                                item.confidence
+                            ).toFixed(1)}%
+                        </strong>
+
+                    </td>
+                    `;
 
 
-                                <td>
+                tbody.appendChild(row);
 
-                                    <span
-                                        class="${
-                                            isReal
-                                            ? "history-real"
-                                            : "history-fake"
-                                        }"
-                                    >
-
-                                        ${escapeHTML(
-                                            item.prediction
-                                        )}
-
-                                    </span>
-
-                                </td>
-
-
-                                <td>
-
-                                    ${Number(
-                                        item.confidence
-                                    ).toFixed(2)}%
-
-                                </td>
-
-                            </tr>
-
-                        `;
-
-                    }
-                )
-                .join("");
+            }
+        );
 
     }
-
-
-    catch (error) {
+    catch(error) {
 
         console.error(
             "History error:",
@@ -2983,23 +3027,73 @@ async function loadHistory() {
         );
 
     }
+
 }
 
 
-/* ============================================================
-   CLEAR HISTORY
-   ============================================================ */
+// ==========================================================
+// LOAD STATISTICS
+// ==========================================================
+
+async function loadStatistics() {
+
+    try {
+
+        const response = await fetch("/statistics");
+        const data = await response.json();
+
+        document.getElementById("totalArticles").textContent = data.total || 0;
+        document.getElementById("realArticles").textContent = data.real || 0;
+        document.getElementById("fakeArticles").textContent = data.fake || 0;
+        if (data.model_accuracy !== null && data.model_accuracy !== undefined) {
+
+            const accuracyText =
+                Number(data.model_accuracy).toFixed(2) + "%";
+
+            document.getElementById("modelAccuracy").textContent =
+                accuracyText;
+
+            const statusAccuracy =
+                document.getElementById("modelAccuracyStatus");
+
+            if (statusAccuracy) {
+                statusAccuracy.textContent =
+                    accuracyText;
+            }
+
+        } else {
+
+            document.getElementById("modelAccuracy").textContent =
+                "Unavailable";
+
+            const statusAccuracy =
+                document.getElementById("modelAccuracyStatus");
+
+            if (statusAccuracy) {
+                statusAccuracy.textContent =
+                    "Unavailable";
+            }
+        }
+
+    } catch(error) {
+        console.error("Statistics error:", error);
+    }
+}
+
+
+// ==========================================================
+// CLEAR HISTORY
+// ==========================================================
 
 async function clearHistory() {
 
     const confirmed =
         confirm(
-            "Are you sure you want to clear all prediction history?"
+            "Are you sure you want to clear prediction history?"
         );
 
 
     if (!confirmed) {
-
         return;
     }
 
@@ -3025,186 +3119,65 @@ async function clearHistory() {
                 data.error ||
                 "Unable to clear history."
             );
+
         }
 
 
         loadHistory();
 
-    }
-
-
-    catch (error) {
+        loadStatistics();
 
         alert(
+            "Prediction history cleared successfully."
+        );
+
+    }
+    catch(error) {
+
+        alert(
+            "Error: " +
             error.message
         );
 
     }
+
 }
 
 
-/* ============================================================
-   COMPONENT DETAILS
-   ============================================================ */
+// ==========================================================
+// HTML ESCAPE
+// ==========================================================
 
-function showComponent(
-    number,
-    element
-) {
+function escapeHtml(value) {
 
-
-    document
-        .querySelectorAll(
-            ".component-btn"
-        )
-        .forEach(
-            function (button) {
-
-                button.classList.remove(
-                    "active"
-                );
-
-            }
+    const div =
+        document.createElement(
+            "div"
         );
 
+    div.textContent =
+        value == null
+            ? ""
+            : String(value);
 
-    element.classList.add(
-        "active"
-    );
-
-
-    const title =
-        document.getElementById(
-            "detailsTitle"
-        );
-
-
-    const text =
-        document.getElementById(
-            "detailsText"
-        );
-
-
-    const details = {
-
-        1: {
-
-            title:
-                "NLP Preprocessing",
-
-            text:
-                "The news article is cleaned and prepared before classification. The processed text is passed to the BERT tokenizer and classification model."
-
-        },
-
-
-        2: {
-
-            title:
-                "BERT Classification",
-
-            text:
-                "BERT learns contextual relationships between words and sentences. The fine-tuned BERT classifier uses these language patterns to classify the input as Real or Fake."
-
-        },
-
-
-        3: {
-
-            title:
-                "Knowledge-Guided Analysis",
-
-            text:
-                "The system checks the article for suspicious linguistic signals such as sensational wording, absolute claims and other suspicious expressions."
-
-        },
-
-
-        4: {
-
-            title:
-                "Confidence Analysis",
-
-            text:
-                "The classifier produces a prediction confidence score. The dashboard displays this value as a percentage."
-
-        }
-
-    };
-
-
-    title.innerText =
-        details[number].title;
-
-
-    text.innerText =
-        details[number].text;
+    return div.innerHTML;
 }
 
 
-/* ============================================================
-   NAVIGATION
-   ============================================================ */
+// ==========================================================
+// INITIAL LOAD
+// ==========================================================
 
-function scrollToSection(id) {
+document.addEventListener(
+    "DOMContentLoaded",
+    function() {
 
-    const element =
-        document.getElementById(id);
+        loadHistory();
 
+        loadStatistics();
 
-    if (!element) {
-
-        return;
     }
-
-
-    element.scrollIntoView({
-        behavior: "smooth",
-        block: "start"
-    });
-}
-
-
-/* ============================================================
-   HTML ESCAPE
-   ============================================================ */
-
-function escapeHTML(value) {
-
-    return String(value)
-
-        .replaceAll(
-            "&",
-            "&amp;"
-        )
-
-        .replaceAll(
-            "<",
-            "&lt;"
-        )
-
-        .replaceAll(
-            ">",
-            "&gt;"
-        )
-
-        .replaceAll(
-            '"',
-            "&quot;"
-        )
-
-        .replaceAll(
-            "'",
-            "&#039;"
-        );
-}
-
-
-/* ============================================================
-   INITIAL LOAD
-   ============================================================ */
-
-loadHistory();
+);
 
 </script>
 
@@ -3279,9 +3252,9 @@ def predict():
         )
 
 
-        # ====================================================
-        # MODEL PREDICTION
-        # ====================================================
+        # ----------------------------------------------------
+        # BERT PREDICTION
+        # ----------------------------------------------------
 
         prediction, confidence = \
             predict_news(text)
@@ -3293,26 +3266,21 @@ def predict():
         )
 
         print(
-            "Raw confidence:",
+            "Confidence:",
             confidence
         )
 
 
-        # ====================================================
+        # ----------------------------------------------------
         # CONFIDENCE
-        # ====================================================
+        # ----------------------------------------------------
 
         confidence = float(
             confidence
         )
 
 
-        # If predict.py returns 0-1,
-        # convert to percentage.
-
-        if (
-            0 <= confidence <= 1
-        ):
+        if 0 <= confidence <= 1:
 
             confidence *= 100
 
@@ -3329,33 +3297,29 @@ def predict():
         )
 
 
-        # ====================================================
-        # SUSPICIOUS LANGUAGE
-        # ====================================================
+        # ----------------------------------------------------
+        # EXPLANATION
+        # ----------------------------------------------------
 
-        explanation =get_explanation(text)
+        warning_layer = get_warning_layer(text)
+        explanation = warning_layer  # Keep compatibility with the existing UI.
 
 
-        # ====================================================
-        # SAVE HISTORY
-        # ====================================================
+        # ----------------------------------------------------
+        # SAVE
+        # ----------------------------------------------------
 
         save_prediction(
-
             text,
-
             str(prediction),
-
             confidence,
-
-            explanation["message"]
-
+            warning_layer["message"],
         )
 
 
-        # ====================================================
-        # RETURN RESULT
-        # ====================================================
+        # ----------------------------------------------------
+        # RETURN
+        # ----------------------------------------------------
 
         return jsonify({
 
@@ -3365,8 +3329,9 @@ def predict():
             "confidence":
                 confidence,
 
-            "explanation":
-                explanation
+            "explanation": explanation,
+
+            "warning_layer": warning_layer,
 
         })
 
@@ -3383,6 +3348,8 @@ def predict():
             ":",
             str(e)
         )
+
+        print("=" * 60)
 
 
         return jsonify({
@@ -3412,7 +3379,6 @@ def history():
 
         })
 
-
     except Exception as e:
 
         return jsonify({
@@ -3420,6 +3386,36 @@ def history():
             "error":
                 str(e)
 
+        }), 500
+
+
+# ============================================================
+# STATISTICS API
+# ============================================================
+
+@app.route(
+    "/statistics",
+    methods=["GET"]
+)
+def statistics():
+
+    try:
+        stats = get_statistics()
+        model_accuracy = get_model_accuracy()
+
+        return jsonify({
+            "total": stats["total"],
+            "real": stats["real"],
+            "fake": stats["fake"],
+            "model_accuracy": model_accuracy
+        })
+
+    except Exception as e:
+        print("Statistics error:", e)
+
+        return jsonify({
+            "error": str(e),
+            "model_accuracy": None
         }), 500
 
 
@@ -3457,28 +3453,29 @@ def delete_history():
 
 
 # ============================================================
-# INITIALIZE DATABASE
+# START APPLICATION
 # ============================================================
 
 init_database()
 
 
-# ============================================================
-# START APPLICATION
-# ============================================================
-
 if __name__ == "__main__":
 
     print()
-    print("=" * 60)
-    print("FAKE NEWS DETECTION USING NLP")
-    print("=" * 60)
+    print("=" * 65)
+    print("        NEWSGUARD AI - FAKE NEWS DETECTION")
+    print("=" * 65)
+    print()
     print("Dashboard:")
     print("http://127.0.0.1:5000")
     print()
     print("Model:")
-    print("BERT + Knowledge Guided Analysis")
-    print("=" * 60)
+    print("BERT + NLP + Knowledge Guided Analysis")
+    print()
+    print("Database:")
+    print("prediction_history.db")
+    print()
+    print("=" * 65)
     print()
 
 
